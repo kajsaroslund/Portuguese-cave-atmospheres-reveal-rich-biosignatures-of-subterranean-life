@@ -1,0 +1,101 @@
+library(readxl)
+library(dplyr)
+library(tibble)
+library(tidyr)
+
+# Set working directory
+setwd("directory”); getwd()
+
+# Import data files
+asv_data <- read_excel("microbe_data.xlsx")
+voc_data <- read_excel("VOC data_data.xlsx")
+
+#Ensure sample order using sample ID
+asv_data <- asv_data %>% arrange(ID)
+voc_data <- voc_data %>% arrange(ID)
+
+# Match check
+all(asv_data$ID == voc_data$ID)
+
+# Remove sampel ID
+asv_mat <- asv_data %>% select(-ID) %>% as.matrix()
+voc_mat <- voc_data %>% select(-ID) %>% as.matrix()
+
+# Microbiome relative abundances if needed)
+asv_mat <- asv_mat / rowSums(asv_mat)
+
+# VOC log transformation
+min_nonzero <- min(voc_mat[voc_mat > 0], na.rm = TRUE)
+c_value <- 0.5 * min_nonzero
+voc_mat <- log(voc_mat + c_value)
+
+# Build correlation matrix
+cor_matrix <- cor(asv_mat, voc_mat, method = "pearson")
+
+# Compute correlation + p-value, fill matrices
+cor_test <- function(x, y) {
+   test <- cor.test(x, y, method = "pearson")
+   c(correlation = test$estimate, p_value = test$p.value)
+}
+p_vals   <- matrix(NA, nrow = ncol(asv_mat), ncol = ncol(voc_mat))
+   for (i in 1:ncol(asv_mat)) {
+      for (j in 1:ncol(voc_mat)) {
+          res <- cor_test(asv_mat[, i], voc_mat[, j])
+          p_vals[i, j]   <- res["p_value"]
+    }
+}
+
+# Add row/column names
+rownames(p_vals) <- colnames(asv_mat)
+colnames(p_vals) <- colnames(voc_mat)
+
+# Convert p matrix to long format
+p_df <- as.data.frame(p_vals) %>%
+   rownames_to_column("taxa") %>%
+   pivot_longer(-taxa, names_to = "VOC", values_to = "p_value")
+
+# Bonferroni correction
+p_df <- p_df %>%
+    mutate(p_adj = p.adjust(p_value, method = "bonferroni"))
+
+# Convert correlation matrix to long format
+cor_df <- as.data.frame(cor_matrix) %>%
+    rownames_to_column("taxa") %>%
+    pivot_longer(-taxa, names_to = "VOC", values_to = "correlation")
+
+# Combine correlations and adjusted p-values
+results_df <- cor_df %>%
+    left_join(
+        p_df %>% select(taxa, VOC, p_adj),
+        by = c("taxa", "VOC")
+    )
+
+# Filter edges
+edges <- results_df %>%
+    filter(
+        p_adj < 0.05,
+        abs(correlation) >= 0.8
+  )%>%
+    select(
+        from = taxa,
+        to = VOC,
+        weight = correlation,
+        p_adj
+  )
+
+# Number of retained edges
+nrow(edges)
+
+# Build network graph
+install.packages("ggraph")
+library(ggraph)
+library(igraph)
+
+g <- graph_from_data_frame(edges, directed = FALSE)
+V(g)$type <- ifelse(V(g)$name %in% colnames(asv_mat), "microbe", "VOC")
+ggraph(g, layout = "fr", weights = abs(E(g)$weight)) +
+    geom_edge_link(aes(width = abs(weight), color = weight)) +
+    geom_node_point(aes(color = type), size = 4) +
+    geom_node_text(aes(label = name), repel = TRUE, size = 3) +
+    scale_edge_color_gradient2(low = "blue", mid = "grey", high = "red") +
+    theme_void()
